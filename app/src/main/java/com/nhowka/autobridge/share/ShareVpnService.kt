@@ -79,11 +79,14 @@ class ShareVpnService : VpnService() {
         if (running != null && phone == "$host:$port") return START_NOT_STICKY // same phone: already sharing
         stopSharing()
         try {
-            val b = Builder().setSession("Internet from phone").setMtu(1500)
+            // Android 10+ treats a VPN as metered unless told otherwise → apps with "Wi-Fi only" downloads/streaming
+            // refused to use it ("no Wi-Fi"). The head unit has no other internet, so report the VPN as unmetered.
+            val b = Builder().setSession("Internet from phone").setMtu(1500).setMetered(false)
                 .addAddress("10.255.77.1", 32).addDnsServer("1.1.1.1").addDnsServer("8.8.8.8")
             ROUTES.forEach { (a, len) -> b.addRoute(a, len) }
             val fd = b.establish() ?: error("VPN not allowed (appops ACTIVATE_VPN)")
             tun = fd
+            reportAsOnline()
             val cfg = File(filesDir, "tun2socks.yml")
             cfg.writeText("""
                 tunnel:
@@ -116,6 +119,30 @@ class ShareVpnService : VpnService() {
     }
 
     override fun onRevoke() { stopSharing(); stopSelf() }
+    /**
+     * The head unit's only internet is this VPN, so Android reports "no active network" to apps that ask the classic
+     * way (getActiveNetworkInfo → null) and some (YouTube) go offline without trying. Android 11 answers that question
+     * from the VPN's underlying networks: when there is no real one, declare the VPN itself, so the answer is "VPN,
+     * connected". When the head unit does have its own network, leave the default (follow the system default).
+     */
+    private fun reportAsOnline() {
+        val cm = getSystemService(android.net.ConnectivityManager::class.java)
+        Thread {
+            repeat(20) {
+                @Suppress("DEPRECATION")
+                val nets = cm.allNetworks.mapNotNull { n -> cm.getNetworkCapabilities(n)?.let { n to it } }
+                val own = nets.firstOrNull { (_, c) -> c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) && c.ownerUid == android.os.Process.myUid() }?.first
+                val real = nets.any { (_, c) -> !c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) && c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) }
+                if (own != null) {
+                    if (!real && tun != null) runCatching { setUnderlyingNetworks(arrayOf(own)) }
+                        .onSuccess { Log.i(TAG, "no other network: VPN reported as the active network") }
+                    return@Thread
+                }
+                Thread.sleep(250)
+            }
+        }.start()
+    }
+
     override fun onDestroy() { stopSharing(); super.onDestroy() }
 }
 
