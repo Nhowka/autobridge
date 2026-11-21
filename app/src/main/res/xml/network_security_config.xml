@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The car's AutoBridge is reached over plain HTTP on private addresses (car Wi-Fi, 127.0.0.1 forwarders) that
+     change, so cleartext is allowed; it only carries the share offer/status. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

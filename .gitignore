@@ -1,0 +1,9 @@
+.gradle/
+local.properties
+.idea/
+*.iml
+.DS_Store
+.cxx/
+build/
+.kotlin/
+installer-dex/build/

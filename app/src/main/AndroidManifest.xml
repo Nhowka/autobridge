@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Phone: start sharing when the car's Bluetooth connects (wireless Android Auto starts there). -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="AutoBridge"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.AutoBridge">
+
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Phone → car set-up over USB (ADB); offered by Android when an ADB device is plugged in. -->
+        <activity android:name=".setup.SetupCarActivity" android:exported="true" android:label="@string/setup_label">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" android:resource="@xml/adb_device_filter" />
+        </activity>
+
+        <!-- Car: control API + VPN controller. -->
+        <service android:name=".car.BridgeService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Car head unit: receives internet from the owner's phone over their Wi-Fi link" />
+        </service>
+        <!-- Car: all head-unit internet traffic → the phone's SOCKS5 proxy (hev-socks5-tunnel). -->
+        <service android:name=".share.ShareVpnService" android:exported="false" android:foregroundServiceType="specialUse"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter><action android:name="android.net.VpnService" /></intent-filter>
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Uses the owner's phone mobile data as the car head unit's internet connection" />
+        </service>
+        <!-- Phone: SOCKS5 proxy on the car network, traffic out on mobile data. -->
+        <service android:name=".share.PhoneShareService" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Shares the phone's mobile data with the owner's car head unit over their existing Wi-Fi link" />
+        </service>
+
+        <receiver android:name=".share.CarBluetoothReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.bluetooth.device.action.ACL_CONNECTED" />
+                <action android:name="android.bluetooth.device.action.ACL_DISCONNECTED" />
+            </intent-filter>
+        </receiver>
+        <receiver android:name=".car.BootReceiver" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /></intent-filter>
+        </receiver>
+        <!-- From the phone's USB set-up only (adb shell holds DUMP, apps can't): car role. -->
+        <receiver android:name=".car.SetupReceiver" android:exported="true" android:permission="android.permission.DUMP">
+            <intent-filter><action android:name="com.nhowka.autobridge.SETUP" /></intent-filter>
+        </receiver>
+    </application>
+</manifest>

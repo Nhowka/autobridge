@@ -1,0 +1,4 @@
+# hev-socks5-tunnel registers its natives on this exact class name in JNI_OnLoad (see jniLibs/README.md).
+-keep class com.nhowka.autobridge.share.Tun2Socks { *; }
+# JNI symbol Java_com_nhowka_autobridge_net_IfaceSocket_bindToDevice.
+-keep class com.nhowka.autobridge.net.IfaceSocket { native <methods>; }
