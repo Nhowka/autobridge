@@ -113,6 +113,8 @@ class ShareVpnService : VpnService() {
     }
 
     private fun stopSharing() {
+        netCallback?.let { cb -> runCatching { getSystemService(android.net.ConnectivityManager::class.java).unregisterNetworkCallback(cb) } }
+        netCallback = null; declared = null; decidedFor = null; underlying = "follow default"
         runCatching { if (Tun2Socks.TProxyIsRunning()) Tun2Socks.TProxyStopService() }
         runCatching { tun?.close() }
         tun = null; phone = ""; running = null
@@ -120,27 +122,84 @@ class ShareVpnService : VpnService() {
 
     override fun onRevoke() { stopSharing(); stopSelf() }
     /**
-     * The head unit's only internet is this VPN, so Android reports "no active network" to apps that ask the classic
-     * way (getActiveNetworkInfo → null) and some (YouTube) go offline without trying. Android 11 answers that question
-     * from the VPN's underlying networks: when there is no real one, declare the VPN itself, so the answer is "VPN,
-     * connected". When the head unit does have its own network, leave the default (follow the system default).
+     * What apps are told about the connection. Android 11 answers getActiveNetworkInfo() (and "is it metered?", "is it
+     * Wi-Fi?") from the VPN's *underlying* networks, never from the VPN itself; with none, apps hear "offline" and the
+     * VPN is forced metered. Re-decided whenever the head unit's other networks change (telematics modem, QNX link,
+     * Wi-Fi client… come and go):
+     *  1. a validated network of its own → null: follow the system default, Android gets it right;
+     *  2. otherwise try, in order, its connected networks without internet (unmetered, Wi-Fi/Ethernet first), then the
+     *     VPN itself, and keep the first one apps are told is *connected*. Checked, not assumed: on a Jaecoo the
+     *     car's own modem (eth0_101, "Ethernet" with a cellular transport) reads CONNECTED by itself, yet declared
+     *     as underlying, apps got "Ethernet DISCONNECTED" – the offline YouTube saw. This app sits inside its own VPN,
+     *     so what it reads is what YouTube reads. Traffic follows the VPN's routes whatever is declared.
      */
+    @Volatile private var underlying: String = "follow default"
+    private var netCallback: android.net.ConnectivityManager.NetworkCallback? = null
+    private var declared: List<android.net.Network>? = null
+    /** The other networks (and whether validated) the last decision was made for: our own declarations change the
+     *  VPN's capabilities, which calls back here, and must not start a new round. */
+    private var decidedFor: String? = null
+    private val decider = java.util.concurrent.Executors.newSingleThreadExecutor()
+
     private fun reportAsOnline() {
         val cm = getSystemService(android.net.ConnectivityManager::class.java)
-        Thread {
-            repeat(20) {
-                @Suppress("DEPRECATION")
-                val nets = cm.allNetworks.mapNotNull { n -> cm.getNetworkCapabilities(n)?.let { n to it } }
-                val own = nets.firstOrNull { (_, c) -> c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) && c.ownerUid == android.os.Process.myUid() }?.first
-                val real = nets.any { (_, c) -> !c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) && c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) }
-                if (own != null) {
-                    if (!real && tun != null) runCatching { setUnderlyingNetworks(arrayOf(own)) }
-                        .onSuccess { Log.i(TAG, "no other network: VPN reported as the active network") }
-                    return@Thread
-                }
-                Thread.sleep(250)
+        val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(n: android.net.Network) = later(cm)
+            override fun onLost(n: android.net.Network) = later(cm)
+            override fun onCapabilitiesChanged(n: android.net.Network, c: android.net.NetworkCapabilities) = later(cm)
+        }
+        // A default request only lists non-VPN networks; drop NOT_VPN so our own VPN shows up too.
+        val req = android.net.NetworkRequest.Builder().removeCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .removeCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET).build()
+        runCatching { cm.registerNetworkCallback(req, cb); netCallback = cb }
+    }
+
+    /** Off the connectivity thread: deciding waits a moment after each declaration. */
+    private fun later(cm: android.net.ConnectivityManager) { runCatching { decider.execute { decide(cm) } } }
+
+    @Synchronized private fun decide(cm: android.net.ConnectivityManager) {
+        if (tun == null) return
+        val VPN = android.net.NetworkCapabilities.TRANSPORT_VPN
+        val VALIDATED = android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED
+        @Suppress("DEPRECATION")
+        val nets = cm.allNetworks.mapNotNull { n -> cm.getNetworkCapabilities(n)?.let { n to it } }
+        val own = nets.firstOrNull { (_, c) -> c.hasTransport(VPN) && c.ownerUid == android.os.Process.myUid() }?.first ?: return
+        val others = nets.filter { (_, c) -> !c.hasTransport(VPN) }
+        val key = others.joinToString { (n, c) -> "$n:${c.hasCapability(VALIDATED)}" }
+        if (key == decidedFor) return
+        if (others.any { (_, c) -> c.hasCapability(VALIDATED) }) {
+            if (declare(null)) { underlying = "follow default (head unit has its own internet)"; decidedFor = key }
+            return
+        }
+        @Suppress("DEPRECATION")
+        val candidates = others.filter { (n, _) -> cm.getNetworkInfo(n)?.isConnected == true }
+            .sortedByDescending { (_, c) ->
+                (if (c.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_NOT_METERED)) 4 else 0) +
+                    (if (c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) ||
+                        c.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET)) 2 else 0)
+            }.map { it.first } + own
+        val log = ArrayList<String>()
+        for (n in candidates) {
+            if (!declare(listOf(n))) { log += "$n: refused"; continue }
+            Thread.sleep(400)
+            @Suppress("DEPRECATION")
+            val seen = cm.activeNetworkInfo
+            log += "$n: apps see ${seen?.let { "${it.typeName} ${it.detailedState}" }}"
+            if (seen?.isConnected == true) {
+                underlying = if (n == own) "declared the VPN itself" else "declared $n (a local network without internet)"
+                decidedFor = key
+                Log.i(TAG, "connection reported to apps: $underlying ($log)")
+                return
             }
-        }.start()
+        }
+        // Nothing reads as connected: stay on the VPN itself (the least bad) and try again on the next change.
+        declare(listOf(own)); underlying = "nothing reads as connected; declared the VPN itself"; decidedFor = key
+        Log.w(TAG, "no declaration reads as connected: $log")
+    }
+
+    private fun declare(pick: List<android.net.Network>?): Boolean {
+        if (pick == declared) return true
+        return runCatching { setUnderlyingNetworks(pick?.toTypedArray()) }.getOrDefault(false).also { if (it) declared = pick }
     }
 
     override fun onDestroy() { stopSharing(); super.onDestroy() }
